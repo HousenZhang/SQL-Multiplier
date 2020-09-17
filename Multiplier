@@ -1,0 +1,185 @@
+USE [Stoma]
+GO
+/****** Object:  StoredProcedure [dbo].[build_Multiplier]    Script Date: 5/1/2017 1:40:02 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- ==========================================================================
+-- Author:		  HaoYuan Zhang
+-- Create date:   April 13, 2017
+--===========================================================================
+
+ALTER PROCEDURE [dbo].[build_Multiplier]
+AS
+
+BEGIN
+
+	DECLARE @date DATETIME
+	SET @date= (SELECT MAX(DATE) FROM main.Survey_Derived_Table)
+
+--==================================================================================================================================================
+/* Building Temp Table For Hos_Size Multiplier*/
+	IF Object_ID('dbo.TemHos_SizeMult') IS NOT NULL DROP TABLE dbo.TemHos_SizeMult;
+	CREATE TABLE dbo.TemHos_SizeMult(
+		[Year]						INT
+		, [Quarter]						INT
+		, CountryName					NVARCHAR(20) 
+		, HospitalSize					NVARCHAR(20) 
+		, Size_Mult						float
+	)
+	
+Insert INTO dbo.TemHos_SizeMult (YEAR, QUARTER, CountryName, HospitalSize, Size_Mult) 
+Select Year, Quarter,U.CountryName, U.[HospitalSize], (U.U_size*1.0)/(S.S_size*1.0) as Mult1 from 
+(
+Select CountryName,Count(A.NPDEst_Annual) AS U_size,A.[HospitalSize] from 
+(
+SELECT CountryName, NPDEst_Annual, CASE WHEN NPDEst_Annual < 10 THEN 'Exclude' ELSE HospitalSize END AS [HospitalSize]
+  FROM [Stoma].[dbo].[StomaUniverse] 
+WHERE  status='Active' AND DATE=@date
+)A
+group by A.[HospitalSize],CountryName
+)U
+inner join
+(
+SELECT year, quarter,CountryName, count(distinct HID) AS S_size, HospitalSize
+FROM Stoma.dbo.View_ProductUsage
+where DATE=@date
+GROUP BY year, quarter,CountryName, HospitalSize
+)S
+on U.[HospitalSize]=S.HospitalSize and U.CountryName=S.CountryName 
+
+--==================================================================================================================================================
+/* Building Temp Table For Multiplier Exclude NPD<10 Hospital*/
+	IF Object_ID('dbo.TemExcldeMult') IS NOT NULL DROP TABLE dbo.TemExcldeMult;
+	CREATE TABLE dbo.TemExcldeMult(
+		 CountryName					NVARCHAR(20) 
+		, Exclude_Mult					float
+	)
+Insert INTO dbo.TemExcldeMult (CountryName, Exclude_Mult)
+Select E.CountryName, 1/(1-E.Exclude/A.ALLNPD) AS Exclude_Mult from 
+(
+SELECT CountryName, SUM(NPDEst_Annual) AS Exclude
+  FROM [Stoma].[dbo].[StomaUniverse] 
+WHERE  status='Active' and NPDEst_Annual < 10 and date=@date
+group by CountryName
+) E
+inner join
+(
+SELECT CountryName, SUM(NPDEst_Annual) AS ALLNPD
+  FROM [Stoma].[dbo].[StomaUniverse] 
+WHERE  status='Active' and date=@date
+group by CountryName
+) A
+on E.CountryName=A.CountryName 
+--==================================================================================================================================================
+/* update Multiplier table with the New Multipliers for the latest quarter only*/
+	UPDATE [dbo].[Multipliers]
+	SET [Multipliers].Mult= Hos_Size.Mult
+	From
+(
+Select Year, Quarter, A.CountryName,[HospitalSize],Size_Mult*Exclude_Mult As Mult
+from dbo.TemHos_SizeMult A
+join 
+dbo.TemExcldeMult B
+on A.CountryName=B.CountryName
+)Hos_Size
+where [Multipliers].year=Hos_Size.year and [Multipliers].quarter=Hos_Size.quarter  and [Multipliers].CountryName=Hos_Size.CountryName
+and [Multipliers].[HospitalSize]=Hos_Size.[HospitalSize]
+
+--==================================================================================================================================================
+/* Build Temp table for Sponsorship for UK*/
+	IF Object_ID('dbo.TemSponsorship_Mult') IS NOT NULL DROP TABLE dbo.TemSponsorship_Mult;
+	CREATE TABLE dbo.TemSponsorship_Mult(
+		[Year]						INT
+		, [Quarter]						INT
+		, Sponsorship_Name				NVARCHAR(50) 
+		, S_Mult						float
+	)
+Insert into dbo.TemSponsorship_Mult (Year, Quarter, Sponsorship_Name, S_Mult)
+Select Year, Quarter, U.Sponsorship_Name,U_SS/S_SS as Mult_S from
+(
+SELECT Count(SU_ID)*1.0/(Select Count(SU_ID) as ALLF from Stoma.dbo.StomaUniverse 
+where  CountryName='United Kingdom' and NPDEst_Annual>=10
+and date=@date )
+AS U_SS,Sponsorship_Name
+FROM Stoma.dbo.StomaUniverse SU
+INNER JOIN
+Stoma.dbo.Sponsorship_Name S
+ON Su.Sponsorship_ID = S.Sponsorship_ID
+where SU.NPDEst_Annual>=10 and date =@date
+group by Sponsorship_Name
+)U
+Inner Join
+(
+SELECT Count(Distinct HID)*1.0/
+(Select Count(Distinct HID) from Stoma.dbo.View_ProductUsage where CountryName = 'United Kingdom' and date=@date)
+ AS S_SS, Year, Quarter,  Sponsorship_Name
+FROM Stoma.dbo.View_ProductUsage A
+WHERE CountryName = 'United Kingdom' and date=@date
+GROUP BY  Year, Quarter,  Sponsorship_Name
+)S
+On  U.Sponsorship_Name=S.Sponsorship_Name
+
+--==================================================================================================================================================
+/*  update Multipliers for UK*/
+	UPDATE [dbo].[Multipliers]
+	SET [Multipliers].Mult= UK_Mult.Mult
+	From
+(
+Select A.year,A.quarter, A.HospitalSize,A.[PrelimN_Count]/B.[Count] as mult from
+(
+SELECT VPU.Year, VPU.Quarter, VPU.HospitalSize, SUM(UKPM.Mult * VPU.Count) AS [PrelimN_Count]
+FROM SToma.dbo.View_ProductUsage VPU
+INNER JOIN
+Stoma.[dbo].[Multipliers] UKPM
+ON VPU.Year = UKPM.Year AND VPU.Quarter = UKPM.Quarter AND VPU.HospitalSize = UKPM.HospitalSize and VPU.Countryname=UKPM.CountryName
+WHERE VPU.CountryName = 'United Kingdom' and VPU.date=@date
+Group by VPU.Year, VPU.Quarter, VPU.HospitalSize
+)A
+inner join 
+(
+SELECT HospitalSize, SUM(Count*mult) AS [Count],  A.Year, A.Quarter
+FROM Stoma.dbo.View_ProductUsage A
+Inner Join 
+[dbo].[Sponsorship] B
+On A.year=B.year and A.quarter=B.quarter and A.Sponsorship_Name = B.Sponsorship_Name
+WHERE CountryName = 'United Kingdom' and date=@date
+GROUP BY  HospitalSize, A.Year, A.Quarter
+)B
+on  A.HospitalSize=B.HospitalSize
+) UK_Mult
+where [Multipliers].year=UK_Mult.year and [Multipliers].quarter=UK_Mult.quarter  and [Multipliers].CountryName='United Kingdom'
+and [Multipliers].[HospitalSize]=UK_Mult.[HospitalSize]
+
+--==================================================================================================================================================
+/*  Setup Multipliers for Brazil*/
+
+	UPDATE [dbo].[Multipliers_Brazil]
+	SET [Multipliers_Brazil].Mult= Brazil_Mult.Mult
+	From
+	(Select year,quarter,A.regionName,Mult1/Mult2 as Mult from 
+(select regionName, population/SUM(population) over (PARTITION by CountryName)/2+
+ GDP/SUM(GDP) over (PARTITION by CountryName)/2 as Mult1 from [dbo].[BrazilRegion]) A
+ join
+(
+select R.[Year],R.[Quarter], region1,sum(r.[Count])*1.0/(Select SUM(Count)from [Stoma].[dbo].[View_ProductUsage]  where [countryname] = 'Brazil' and date=@date) as Mult2
+FROM [Stoma].[dbo].[Hospitals] U
+   join 
+  (Select  year, quarter,HID, Count from [Stoma].[dbo].[View_ProductUsage]  where [countryname] = 'Brazil' and date=@date)R
+  on R.[HID] = U.[HID]
+  group by R.[Year],R.[Quarter], region1
+  ) B
+  on A.regionname=B.region1)Brazil_Mult
+  where [Multipliers_Brazil].[State]=Brazil_Mult.RegionName and [Multipliers_Brazil].year=Brazil_Mult.year  and [Multipliers_Brazil].quarter=Brazil_Mult.quarter
+
+
+DROP TABLE dbo.TemHos_SizeMult
+DROP TABLE dbo.TemExcldeMult
+DROP TABLE dbo.TemSponsorship_Mult
+
+
+
+
+END
