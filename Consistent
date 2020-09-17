@@ -1,0 +1,316 @@
+USE [Stoma]
+GO
+/****** Object:  StoredProcedure [dbo].[build_ConsistentHID_table]    Script Date: 5/1/2017 1:42:16 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+-- ==========================================================================
+-- Author:		  HaoYuan Zhang
+-- Create date:   March 4, 2017
+--===========================================================================
+
+
+
+
+
+
+
+ALTER PROCEDURE [dbo].[build_ConsistentHID_table]
+AS
+
+BEGIN
+
+	DECLARE @USER NVARCHAR(50)
+	SELECT @USER = SYSTEM_USER
+	INSERT INTO Stoma_Testing.dbo.SPExecLog (ModifiedBy, [Action], [Status]) VALUES(@USER, 'Execute ConsistentHID Script', 'ConsistentHID Script Started')
+
+
+
+	
+	
+	IF Object_ID('dbo.ConsistentHID') IS NOT NULL DROP TABLE dbo.ConsistentHID;
+	CREATE TABLE dbo.ConsistentHID(
+		C_ID							INT Identity(1,1) PRIMARY KEY
+		, HID							INT
+		, [Date]						DATETIME
+		, [Year]						INT
+		, [Quarter]						INT
+		, OneQB							NVARCHAR(20) DEFAULT 'Inconsistent'
+		, OneQBColoplast				NVARCHAR(20) DEFAULT 'Inconsistent'
+		, SevenQB						NVARCHAR(20) DEFAULT 'Inconsistent'
+		, ALLQB							NVARCHAR(20) DEFAULT 'Inconsistent'
+		, SevenQBColoplast				NVARCHAR(20) DEFAULT 'Inconsistent'
+		, StronglyConsistent			NVARCHAR(20) DEFAULT 'Inconsistent'
+		, StronglyConsistentColoplast	NVARCHAR(20) DEFAULT 'Inconsistent'
+		, OneQBRolling					NVARCHAR(20) DEFAULT 'Inconsistent'
+		, SevenQBRolling				NVARCHAR(20) DEFAULT 'Inconsistent'
+		, ALLQBRolling					NVARCHAR(20) DEFAULT 'Inconsistent'
+		, StronglyConsistentRolling		NVARCHAR(20) DEFAULT 'Inconsistent'
+	)
+
+		INSERT INTO dbo.ConsistentHID (HID, [Date], [Year], [Quarter]) SELECT DISTINCT HID, [Date], YEAR([Date]), MONTH([Date])/3 FROM main.Survey_Derived_Table ORDER BY HID, [Date]
+--==================================================================================================================================================
+/* Building SampleRecord Table*/
+IF Object_ID('Stoma.[dbo].[SampleRecord]') IS NOT NULL DROP TABLE Stoma..[SampleRecord];
+	CREATE TABLE Stoma..SampleRecord(
+		  CountryName					NVARCHAR(50) DEFAULT 'Inconsistent'
+		, [Year]						INT
+		, [Quarter]						INT
+		, [Date]						DateTime
+	)
+INSERT INTO Stoma..SampleRecord 
+Select Distinct Country,Year,Quarter,Date from main.Survey_Derived_Table 
+
+
+
+
+--==================================================================================================================================================
+/* Building a TEMP Table*/
+IF Object_ID('Stoma.dbo.[SampleRecordrolling]') IS NOT NULL DROP TABLE Stoma..SampleRecordrolling;
+	CREATE TABLE Stoma..SampleRecordrolling(
+		  [Row_Number]						INT		
+		, CountryName					NVARCHAR(50) DEFAULT 'Inconsistent'
+		, [Year]						INT
+		, [Quarter]						INT
+		, [Date]						DateTime
+	)
+
+INSERT INTO Stoma..SampleRecordrolling ([Row_Number], CountryName, Year, Quarter,Date)
+Select row_number() over (partition by CountryName order by date),CountryName,year, Quarter,Date from [dbo].[SampleRecord]
+
+
+
+
+--===================================================================================================================================================
+	/* UPDATE One quarter back consistency */
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.OneQB = OneQB_Query.OneQB
+	FROM
+	(
+		SELECT HID, 'Consistent' AS OneQB
+		FROM (
+				SELECT DISTINCT [DATE], HID, 1 AS SCOUNT
+				FROM  main.Survey_Derived_Table 
+				WHERE  [DATE] BETWEEN [dbo].[ConsistencySecondMaxDate](Country) AND [dbo].[ConsistencyMaxDate](Country)
+			  ) AS A
+		GROUP BY HID
+		HAVING SUM(SCOUNT) = 2
+	) AS OneQB_Query
+	WHERE ConsistentHID.HID = OneQB_Query.HID
+--================================================================================
+	/* UPDATE seven quarters back consistency */
+--================================================================================
+		UPDATE dbo.ConsistentHID
+	SET ConsistentHID.SevenQB = SevenQB_Query.SevenQB
+	FROM
+	(
+		SELECT HID, 'Consistent' AS SevenQB,Country
+		FROM (
+				SELECT DISTINCT [DATE], HID, 1 AS SCOUNT,country
+				FROM  main.Survey_Derived_Table 
+				WHERE [DATE] BETWEEN DATEADD(Quarter, -7, [dbo].[ConsistencyMaxDate](Country)) AND [dbo].[ConsistencyMaxDate](Country)
+			) AS A
+		GROUP BY HID, Country
+		HAVING SUM(SCOUNT) = [dbo].[7QConsistentCount](Country)
+	) AS SevenQB_Query
+	WHERE ConsistentHID.HID = SevenQB_Query.HID
+
+-- ==========================================================================	
+	/* UPDATE STRONG consistency (Participating >= 6 out of 8 recent quarters) */
+--================================================================================
+		UPDATE dbo.ConsistentHID
+	SET ConsistentHID.StronglyConsistent = SC_Query.StronglyConsistent
+	FROM
+	(
+		SELECT HID, 'Consistent' AS StronglyConsistent,Country
+		FROM (
+				SELECT DISTINCT [DATE], HID, 1 AS SCOUNT,Country
+				FROM  main.Survey_Derived_Table 
+				WHERE [DATE] BETWEEN DATEADD(Quarter, -7, [dbo].[ConsistencyMaxDate](Country)) AND [dbo].[ConsistencyMaxDate](Country)
+			) AS A
+		GROUP BY HID,Country
+		HAVING SUM(SCOUNT) >= [dbo].[7QConsistentCount](Country)*6/8
+	) AS SC_Query
+	WHERE ConsistentHID.HID = SC_Query.HID
+
+
+-- ==========================================================================
+	/* UPDATE all quarters consistency */
+--================================================================================
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.ALLQB = AllQB_Query.AllQB
+	FROM
+	(
+		SELECT HID, 'Consistent' AS AllQB,Country
+		FROM (
+				SELECT DISTINCT [DATE], HID, 1 AS SCOUNT,Country
+				FROM  main.Survey_Derived_Table 
+				WHERE [DATE] BETWEEN [dbo].[ConsistencyFirstDate](Country) AND [dbo].[ConsistencyMaxDate](Country)
+			  ) AS A
+		GROUP BY HID, Country
+		HAVING SUM(SCOUNT) = [dbo].[ALLQConsistentCount](Country)
+	) AS AllQB_Query
+	WHERE ConsistentHID.HID = AllQB_Query.HID
+/**==================================================================================================**/
+
+-- ======================Coloplast ====================================================	
+/* UPDATE One quarter back consistency (Does not need to be updated*/
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.OneQBColoplast = OneQB_Query.OneQBColoplast
+	FROM
+	(
+		SELECT HID, 'Consistent' AS OneQBColoplast
+		FROM (
+				SELECT DISTINCT A1.[DATE], A1.HID, 1 AS SCOUNT
+				FROM  main.Survey_Derived_Table A1
+				Inner Join 
+				[dbo].[CPSampleRecord] B
+				on A1.date=B.date and A1.country=B.countryName
+				WHERE  A1.[DATE] BETWEEN [dbo].[CPConsistencySecondMaxDate](Country) AND [dbo].[CPConsistencyMaxDate](Country)
+			  ) AS A
+		GROUP BY HID
+		HAVING SUM(SCOUNT) = 2
+	) AS OneQB_Query
+	WHERE ConsistentHID.HID = OneQB_Query.HID
+-- ==========================================================================
+	/* UPDATE 7 quarters consistency for Coloplast*/
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.SevenQBColoplast = SevenQB_QueryColoplast.SevenQB
+		FROM
+	(
+		SELECT HID, 'Consistent' AS SevenQB,Country
+		FROM (
+				SELECT DISTINCT A1.[DATE], A1.HID, 1 AS SCOUNT,Country
+				FROM  main.Survey_Derived_Table A1
+				Inner Join 
+				[dbo].[CPSampleRecord] B
+				on A1.date=B.date and A1.country=B.countryName
+				WHERE A1.[DATE] BETWEEN DATEADD(Quarter, -7, [dbo].[CPConsistencyMaxDate](Country)) AND [dbo].[CPConsistencyMaxDate](Country)
+			  ) AS A
+		GROUP BY HID, Country
+		HAVING SUM(SCOUNT) = [dbo].[CP7QConsistentCount](Country)
+	) AS SevenQB_QueryColoplast
+	WHERE ConsistentHID.HID = SevenQB_QueryColoplast.HID
+-- =====================================================================================================
+/* UPDATE STRONG consistency Coloplast*/
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.StronglyConsistentColoplast = SC_Query.StronglyConsistentColoplast
+		FROM
+	(
+		SELECT HID, 'Consistent' AS StronglyConsistentColoplast,Country
+		FROM (
+				SELECT DISTINCT A1.[DATE], A1.HID, 1 AS SCOUNT,Country
+				FROM  main.Survey_Derived_Table A1
+				Inner Join 
+				[dbo].[CPSampleRecord] B
+				on A1.date=B.date and A1.country=B.countryName
+				WHERE A1.[DATE] BETWEEN DATEADD(Quarter, -7, [dbo].[CPConsistencyMaxDate](Country)) AND [dbo].[CPConsistencyMaxDate](Country)
+			 		  ) AS A
+		GROUP BY HID, Country
+		HAVING SUM(SCOUNT) >= [dbo].[CP7QConsistentCount](Country)* 6/8
+	) AS SC_Query
+	WHERE ConsistentHID.HID = SC_Query.HID
+
+
+
+--===================================================================================================================================================
+	/* UPDATE One quarter back consistency ROLLING */
+	UPDATE dbo.ConsistentHID
+	SET ConsistentHID.OneQBRolling = OneQBRolling_Query.OneQBRolling
+	FROM
+	(
+		SELECT  A1.HID, A1.[Date], 'Consistent' AS OneQBRolling
+		FROM 
+		(
+			SELECT DISTINCT [Date], HID, Country FROM main.Survey_Derived_Table
+		) A1
+		INNER JOIN 
+		Stoma..SampleRecordrolling B
+		ON A1.Country=B.CountryName And A1.Date=B.Date
+		INNER JOIN
+		Stoma..SampleRecordrolling C
+		ON B.Row_Number=C.Row_Number+1 and C.CountryName=B.CountryName
+		INNER JOIN
+		(
+			SELECT [Date], HID FROM main.Survey_Derived_Table
+		) A2 ON A2.[Date] = C.[Date] AND A1.HID = A2.HID 
+	) AS OneQBRolling_Query
+	WHERE ConsistentHID.HID = OneQBRolling_Query.HID AND ConsistentHID.[Date] = OneQBRolling_Query.[Date]
+--=================================================================================================================================================
+	/* UPDATE 7 quarters back consistency ROLLING */
+	UPDATE dbo.ConsistentHID
+	SET	dbo.ConsistentHID.SevenQBRolling = SevenQBRolling_Query.SevenQBRolling
+	FROM
+	(
+		SELECT HID, [Date], 'Consistent' AS SevenQBRolling 
+		FROM
+		(
+			SELECT sdt.HID,	sdt.[Date], sdt.Country,
+				(
+					SELECT count(DISTINCT [Date])
+					FROM main.Survey_Derived_Table s
+					WHERE s.HID = sdt.HID AND 
+					s.[Date] BETWEEN DATEADD(quarter, -7, sdt.[Date]) AND sdt.[Date]
+				) AS m
+			FROM main.Survey_Derived_Table sdt
+		)  x
+		WHERE m = [dbo].[Rolling7QConsistentCount](Country,Date)
+	) AS SevenQBRolling_Query
+	WHERE ConsistentHID.HID = SevenQBRolling_Query.HID AND ConsistentHID.[Date] = SevenQBRolling_Query.[Date]
+--=================================================================================================================================================
+	/* UPDATE STRONG consistency (Participating >= 6 out of 8 recent quarters) ROLLING */
+		UPDATE dbo.ConsistentHID
+	SET	dbo.ConsistentHID.StronglyConsistentRolling = SCRolling_Query.StronglyConsistentRolling
+	FROM
+	(
+		SELECT HID, [Date], 'Consistent' AS StronglyConsistentRolling
+		FROM 
+		(
+			SELECT sdt.HID,	sdt.[Date], sdt.Country,
+				(
+					SELECT count(DISTINCT [Date])
+					FROM main.Survey_Derived_Table s
+					WHERE s.HID = sdt.HID AND 
+					s.[Date] BETWEEN DATEADD(quarter, -7, sdt.[Date]) AND sdt.[Date]
+				) AS m
+			FROM main.Survey_Derived_Table sdt
+		)  x
+		WHERE m >= [dbo].[Rolling7QConsistentCount](Country,Date)*6/8
+	) AS SCRolling_Query
+	WHERE ConsistentHID.HID = SCRolling_Query.HID AND ConsistentHID.[Date] = SCRolling_Query.[Date]
+--================================================================================================================================================
+	/* UPDATE all quarters consistency ROLLING */
+	UPDATE dbo.ConsistentHID
+	SET	dbo.ConsistentHID.ALLQBRolling = AllQBRolling_Query.ALLQBRolling
+	FROM
+	(
+		SELECT HID, [Date], 'Consistent' AS ALLQBRolling
+		FROM 
+		(
+			SELECT sdt.HID,	sdt.[Date], sdt.Country,
+				(
+					SELECT count(DISTINCT [Date])
+					FROM main.Survey_Derived_Table s
+					WHERE s.HID = sdt.HID AND 
+					s.[Date] BETWEEN [dbo].[ConsistencyFirstDate](Country) AND sdt.[Date]
+				) AS m
+			FROM main.Survey_Derived_Table sdt
+		)  x
+		WHERE m = [dbo].[RollingALLQConsistentCount](Country,Date)
+	) AS AllQBRolling_Query
+	WHERE ConsistentHID.HID = AllQBRolling_Query.HID AND ConsistentHID.[Date] = AllQBRolling_Query.[Date]
+--=====================================================================================================================================================
+DROP TABLE Stoma..SampleRecordrolling
+
+
+
+
+
+INSERT INTO Stoma_Testing.dbo.SPExecLog (ModifiedBy, [Action], [Status]) VALUES(@USER, 'Execute ConsistentHID Script', 'ConsistentHID Script Ended')
+
+END
+
+
